@@ -2114,6 +2114,11 @@ def publish_feedback_snapshot(
       (version+1) 与新随机访问码, 旧码立即失效, 旧版保留仅供会务方追溯;
     - 该论文在当前序号下存在待完成的评语更正请求时拒绝发布 (409):
       更正请求发起时既有访问码已失效, 须待更正完成后按当前评语重新发布。
+    - 当前发布序号已被该论文的删除凭据冻结时 (删除后未重新发布, 含同编号
+      重新录入) 拒绝发布 (404): 该序号的历史槽位及其确认/评语已随删除失效,
+      即使删除前从未发布过快照也不得以旧收据签发新访问码; 须重新发布分配
+      (推进发布序号) 并由评审人在新序号重新确认、重新交齐两份评语后方可发布。
+      拒绝不生成版本/访问码, 不推进资料修订号; 旧码继续失效, 历史记录仍可追溯。
     """
     now = datetime.now(timezone.utc).isoformat()
     with db.write_txn() as conn:
@@ -2216,6 +2221,21 @@ def publish_feedback_snapshot(
                     "paper_id": paper_id,
                     "invalidated_version": existing["version"],
                 },
+            )
+        if db.paper_deleted_after_publish(conn, paper_id, current_serial):
+            # 删除凭据冻结了当前发布序号 (含同编号重录但尚未重新发布): 该序号的
+            # 历史槽位及其确认/评语已随删除失效。删除前从未发布过快照时不存在可判重
+            # 的旧版本, 绝不可用旧收据签发新访问码 (持码者会读到旧稿评语);
+            # 须先重新发布分配 (推进发布序号), 由两名评审人在新序号重新确认并交齐
+            # 评语后才能为重录稿发布快照。拒绝不生成版本/访问码, 也不推进资料修订号;
+            # 旧码继续失效, 历史记录仍供会务方追溯。
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"论文 {paper_id} 已被会务方删除: 发布序号 {current_serial} 的历史槽位"
+                    " 已随删除凭据冻结, 其确认与评语不得用于签发作者反馈快照; 请重新发布分配"
+                    " (推进发布序号) 并由评审人按新序号重新确认、重新提交评语后再发布快照"
+                ),
             )
         version = conn.execute(
             "SELECT COALESCE(MAX(version), 0) + 1 AS v"

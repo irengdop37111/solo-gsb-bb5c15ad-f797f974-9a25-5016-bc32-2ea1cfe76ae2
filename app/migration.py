@@ -1022,6 +1022,8 @@ def validate_snapshot(data, *, format_version: int = FORMAT_VERSION) -> None:
     #   1. 已撤回论文: 该稿全部快照失效 (撤回同事务失效所有访问码);
     #   2. (v2) 论文删除: 删除时刻 (deleted_at) 及之前创建的快照必已随删除失效;
     #      同编号重新录入不恢复旧码效力——重录后新建快照的创建时刻严格晚于删除时刻;
+    #      删除凭据冻结的发布序号上不可能存在有效快照 (该序号槽位随删除失效,
+    #      运行时拒绝在其上签发新码; 重录稿须重新发布推进序号后才能发布快照);
     #   3. 同 (论文, 发布序号) 内按版本仅最高一版可能有效: 同序号再次发布 version+1,
     #      旧版在更正请求发起时已被置失效;
     #   4. 更正请求 (不论 pending/completed): 快照创建不晚于该请求发起时刻
@@ -1057,11 +1059,19 @@ def validate_snapshot(data, *, format_version: int = FORMAT_VERSION) -> None:
     # v2: 每个编号最近一次删除时刻 (同编号多次"删除->重录"取最晚一次;
     # 删除同事务失效该稿此前全部快照, 重录后旧码继续失效)
     latest_deleted_at = {}
+    frozen_serials_by_paper = {}
     if format_version >= 2:
         for d in data["paper_deletions"]:
             prev = latest_deleted_at.get(d["paper_id"])
             if prev is None or d["deleted_at"] > prev:
                 latest_deleted_at[d["paper_id"]] = d["deleted_at"]
+            # 删除凭据冻结的发布序号: 该序号的历史槽位 (含确认/评语) 已随删除失效,
+            # 其上不可能存在有效快照——删除前的版本已同事务失效, 删除后该序号
+            # 被冻结 (重录稿须重新发布推进序号), 运行时拒绝在其上签发新码
+            if d["published_serial"] is not None:
+                frozen_serials_by_paper.setdefault(d["paper_id"], set()).add(
+                    d["published_serial"]
+                )
 
     # 当前发布方案槽位 -> 现行评语收据: 恢复后"当前有效"码必须读到的仍是现行评语
     current_review_receipts = {}
@@ -1078,6 +1088,7 @@ def validate_snapshot(data, *, format_version: int = FORMAT_VERSION) -> None:
         # 最晚的更正请求发起时刻: 不晚于该时刻创建的版本已随请求发起而失效
         latest_requested_at = max(c["requested_at"] for c in corrections) if corrections else None
         deleted_at = latest_deleted_at.get(pid) if format_version >= 2 else None
+        frozen_serials = frozen_serials_by_paper.get(pid, set())
 
         for s in ordered:
             expect_invalidated = False
@@ -1088,6 +1099,12 @@ def validate_snapshot(data, *, format_version: int = FORMAT_VERSION) -> None:
             if deleted_at is not None and s["created_at"] <= deleted_at:
                 expect_invalidated = True
                 reasons.append("快照创建不晚于论文删除时刻 (删除同事务已失效; 同编号重录不恢复旧码)")
+            if s["serial"] in frozen_serials:
+                expect_invalidated = True
+                reasons.append(
+                    "快照所在发布序号已被删除凭据冻结 (该序号的确认/评语随删除失效,"
+                    " 不得据其签发或保有有效访问码)"
+                )
             if s["version"] != latest_version:
                 expect_invalidated = True
                 reasons.append("同发布序号内已有更新版本")
