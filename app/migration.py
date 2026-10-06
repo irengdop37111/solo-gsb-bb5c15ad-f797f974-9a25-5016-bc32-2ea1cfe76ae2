@@ -1062,6 +1062,15 @@ def validate_snapshot(data, *, format_version: int = FORMAT_VERSION) -> None:
             prev = latest_deleted_at.get(d["paper_id"])
             if prev is None or d["deleted_at"] > prev:
                 latest_deleted_at[d["paper_id"]] = d["deleted_at"]
+        # v2: 删除凭据冻结的 (论文, 发布序号) 对: 删除时当前发布版不重写, 旧槽位
+        # 连同其确认/评语冻结在该序号; 同编号重录后必须重新发布 (推进序号), 在新
+        # 序号重新确认并交齐评语才能发布快照。因此被冻结序号上不允许存在任何标记
+        # 有效的快照——无论其创建时刻早晚, 有效码都会让持码者读到冻结的旧稿评语。
+        frozen_serial_pairs = {
+            (d["paper_id"], d["published_serial"])
+            for d in data["paper_deletions"]
+            if d["published_serial"] is not None
+        }
 
     # 当前发布方案槽位 -> 现行评语收据: 恢复后"当前有效"码必须读到的仍是现行评语
     current_review_receipts = {}
@@ -1088,6 +1097,12 @@ def validate_snapshot(data, *, format_version: int = FORMAT_VERSION) -> None:
             if deleted_at is not None and s["created_at"] <= deleted_at:
                 expect_invalidated = True
                 reasons.append("快照创建不晚于论文删除时刻 (删除同事务已失效; 同编号重录不恢复旧码)")
+            if format_version >= 2 and (pid, serial) in frozen_serial_pairs:
+                expect_invalidated = True
+                reasons.append(
+                    "该发布序号已被论文删除凭据冻结 (同编号重录但未重新发布时不得用"
+                    " 旧确认/旧评语签发快照; 有效快照只能在推进后的新序号上产生)"
+                )
             if s["version"] != latest_version:
                 expect_invalidated = True
                 reasons.append("同发布序号内已有更新版本")

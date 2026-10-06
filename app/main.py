@@ -2114,6 +2114,11 @@ def publish_feedback_snapshot(
       (version+1) 与新随机访问码, 旧码立即失效, 旧版保留仅供会务方追溯;
     - 该论文在当前序号下存在待完成的评语更正请求时拒绝发布 (409):
       更正请求发起时既有访问码已失效, 须待更正完成后按当前评语重新发布。
+    - 论文曾在当前发布序号下被删除 (删除凭据冻结该序号; 含同编号重新录入但
+      尚未重新发布分配) 时拒绝发布 (409): 旧确认/旧评语仅供会务方追溯, 绝不
+      用旧收据生成新版本或访问码 (否则持码者将读到旧稿评语); 被拒请求不产生
+      版本、不推进资料修订号, 旧码继续失效; 须先重新发布分配 (推进序号),
+      在新序号重新确认并交齐两份评语后才能为重录稿发布快照。
     """
     now = datetime.now(timezone.utc).isoformat()
     with db.write_txn() as conn:
@@ -2143,6 +2148,25 @@ def publish_feedback_snapshot(
             raise HTTPException(
                 status_code=409,
                 detail=f"论文 {paper_id} 已撤回, 不可再发布反馈快照 (历史版本保留供追溯)",
+            )
+        if db.paper_deleted_after_publish(conn, paper_id, current_serial):
+            # 删除凭据冻结了当前发布序号: 该序号下的旧确认/旧评语仅供会务方追溯,
+            # 同编号重录但尚未重新发布分配时绝不得用旧收据签发新快照、生成新访问码
+            # (否则持码者将读到旧稿评语)。被拒请求不产生版本或访问码, 也不推进
+            # 资料修订号; 旧码继续失效。会务方须先重新发布分配 (推进发布序号),
+            # 在新序号重新确认并交齐两份评语后才能为重录稿发布快照。
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": (
+                        f"论文 {paper_id} 曾在发布序号 {current_serial} 下被会务方删除"
+                        " (后又以同编号重新录入): 该发布序号已被删除凭据冻结, 旧确认与旧评语"
+                        " 仅供会务方追溯, 不得据此签发作者反馈快照; 请先重新发布分配"
+                        " (推进发布序号), 并在新序号重新确认、交齐两份评语后再发布"
+                    ),
+                    "paper_id": paper_id,
+                    "frozen_serial": current_serial,
+                },
             )
         decisions = _load_decisions(conn, current_serial)
         reviews = _load_reviews(conn, current_serial)

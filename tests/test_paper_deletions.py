@@ -340,6 +340,136 @@ def test_republishing_snapshot_without_serial_advance_conflicts_after_reentry(cl
     assert len(versions) == 1 and versions[0]["access_code"] == old_code
 
 
+def test_reentry_without_prior_snapshot_frozen_serial_publish_rejected(client):
+    """删除前从未发布过反馈快照, 同编号重录但未重新发布分配时,
+
+    当前发布请求不得用删除前旧序号上的旧确认/旧收据生成新访问码:
+    针对冻结序号的快照发布一律 409, 不产生版本或访问码, 不推进资料
+    修订号; 旧 (并不存在的) 码无任何影响, 历史仍供会务方追溯。
+    """
+    serial, receipts = setup_published_paper(client)
+    # 关键前提: 删除前从不发布反馈快照
+    assert client.get(
+        "/papers/P1/feedback-snapshots", headers=ORG
+    ).json()["snapshots"] == []
+
+    rev_before = current_revision(client)
+    assert client.delete("/papers/P1", headers=ORG).status_code == 200
+    assert add_paper(client, "P1", manuscript="重录新稿").status_code == 201
+
+    # 删除与重新录入各推进一次修订号; 快照拒绝不得再推进
+    rev_after_reentry = current_revision(client)
+    assert rev_after_reentry == rev_before + 2
+
+    r = client.post(
+        "/papers/P1/feedback-snapshot", headers=ORG, json={"serial": serial}
+    )
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["frozen_serial"] == serial
+    assert "删除" in detail["message"] and "重新发布" in detail["message"]
+
+    # 不产生版本或访问码, 资料修订号不变
+    assert current_revision(client) == rev_after_reentry
+    trace = client.get(
+        "/papers/P1/feedback-snapshots", headers=ORG
+    ).json()["snapshots"]
+    assert trace == []
+    # 任何凭旧收据猜测的码都与无效码同形 404, 读不到旧稿评语
+    assert client.get("/feedback-snapshots/fbk-deadbeef").status_code == 404
+
+
+def test_frozen_serial_publish_rejected_even_when_old_snapshot_invalidated(client):
+    """删除前已发布过快照时, 冻结序号上的重发同样 409 (既有行为不回退),
+
+    且拒绝不覆盖历史版本行、不推进修订号; 重新发布分配并在新序号重新
+    确认、交齐两份评语后, 新快照正常发布, 旧码持续失效。
+    """
+    serial, _ = setup_published_paper(client)
+    old_code = publish_snapshot(client, "P1", serial)["access_code"]
+    assert client.delete("/papers/P1", headers=ORG).status_code == 200
+    assert add_paper(client, "P1", manuscript="重录新稿").status_code == 201
+
+    rev_after_reentry = current_revision(client)
+    r = client.post(
+        "/papers/P1/feedback-snapshot", headers=ORG, json={"serial": serial}
+    )
+    assert r.status_code == 409
+    assert r.json()["detail"]["frozen_serial"] == serial
+    assert current_revision(client) == rev_after_reentry
+    assert client.get(f"/feedback-snapshots/{old_code}").status_code == 404
+    versions = client.get(
+        "/papers/P1/feedback-snapshots", headers=ORG
+    ).json()["snapshots"]
+    assert len(versions) == 1 and versions[0]["access_code"] == old_code
+    assert versions[0]["active"] is False
+
+    # 必须重新发布分配: 普通发布推进序号
+    new_serial = publish(client)["serial"]
+    assert new_serial == serial + 1
+    # 新序号槽位全部 pending, 资料不齐仍 422
+    assert client.post(
+        "/papers/P1/feedback-snapshot", headers=ORG, json={"serial": new_serial}
+    ).status_code == 422
+    rid_a, rid_b = client.get("/assignment", headers=ORG).json()["plan"]["P1"]
+    decide(client, rid_a, "P1")
+    decide(client, rid_b, "P1")
+    submit_review(client, rid_a, "P1", new_serial, score=3, comment="重录稿评语 R1")
+    submit_review(client, rid_b, "P1", new_serial, score=3, comment="重录稿评语 R2")
+    new_snap = publish_snapshot(client, "P1", new_serial)
+    assert new_snap["version"] == 2
+    new_code = new_snap["access_code"]
+    assert new_code != old_code
+    read = client.get(f"/feedback-snapshots/{new_code}")
+    assert read.status_code == 200
+    comments = [x["comment"] for x in read.json()["reviews"]]
+    assert comments == ["重录稿评语 R1", "重录稿评语 R2"]
+    assert client.get(f"/feedback-snapshots/{old_code}").status_code == 404
+
+
+def test_frozen_serial_publish_rejected_after_backfill_republish_then_succeeds(client):
+    """删除重录后以补位方式重新发布同样推进序号; 冻结序号拒绝、新序号放行。"""
+    serial, _ = setup_published_paper(client)
+    assert client.delete("/papers/P1", headers=ORG).status_code == 200
+    assert add_paper(client, "P1", manuscript="重录新稿").status_code == 201
+
+    # 未重新发布: 冻结序号 409
+    r = client.post(
+        "/papers/P1/feedback-snapshot", headers=ORG, json={"serial": serial}
+    )
+    assert r.status_code == 409
+
+    # 补位发布即重新发布 (删除冻结的旧确认不沿用, 一律 pending)
+    dry = client.post("/assignment/backfill/dry-run", headers=ORG).json()
+    assert dry["feasible"], dry
+    assert {(s["paper_id"], s["reviewer_id"]) for s in dry["deleted_frozen_slots"]} == {
+        ("P1", rid) for rid in dry["plan"]["P1"]
+    }
+    out = client.post(
+        "/assignment/backfill/publish",
+        headers=ORG,
+        json={"base_revision": dry["revision"], "base_serial": dry["serial"]},
+    )
+    assert out.status_code == 200, out.text
+    new_serial = out.json()["serial"]
+    assert new_serial == serial + 1
+
+    # 新序号资料不齐 -> 422; 重新确认并交齐两份评语 -> 200
+    assert client.post(
+        "/papers/P1/feedback-snapshot", headers=ORG, json={"serial": new_serial}
+    ).status_code == 422
+    rid_a, rid_b = out.json()["plan"]["P1"]
+    decide(client, rid_a, "P1")
+    decide(client, rid_b, "P1")
+    submit_review(client, rid_a, "P1", new_serial, score=5, comment="补位新稿评语 R1")
+    submit_review(client, rid_b, "P1", new_serial, score=4, comment="补位新稿评语 R2")
+    new_snap = publish_snapshot(client, "P1", new_serial)
+    assert new_snap["serial"] == new_serial
+    assert client.get(
+        f"/feedback-snapshots/{new_snap['access_code']}"
+    ).status_code == 200
+
+
 def test_multiple_delete_reentry_cycles_append_evidence(client):
     serial, _ = setup_published_paper(client)
     code1 = publish_snapshot(client, "P1", serial)["access_code"]
@@ -457,6 +587,58 @@ def test_restore_rejects_revived_deleted_snapshot_flag_flip(client):
     # 原合法快照仍可恢复, 恢复后旧码 404
     assert restore(client, snap).status_code == 200
     assert client.get(f"/feedback-snapshots/{code}").status_code == 404
+
+
+def test_restore_rejects_valid_snapshot_on_frozen_serial(client):
+    """矛盾快照: 删除凭据冻结的序号上不允许任何标记有效的快照。
+
+    模拟旧缺陷可能落库的状态——删除重录后尚未重新发布, 却存在一条
+    serial=冻结序号、invalidated=false 且评语收据为旧收据的快照 (持码者
+    将读到旧稿评语): 恢复前跨记录重算必须 422 拒绝, 目标实例不留部分数据。
+    """
+    import json as _json
+    import secrets
+    from datetime import datetime, timezone
+
+    serial, _receipts = setup_published_paper(client)
+    assert client.delete("/papers/P1", headers=ORG).status_code == 200
+    assert add_paper(client, "P1", manuscript="重录新稿").status_code == 201
+
+    # 直接注入一条"冻结序号上的有效快照" (运行时接口已拒绝, 此处模拟伪造/旧库)
+    with db.write_txn() as conn:
+        reviews = conn.execute(
+            "SELECT reviewer_id, score, comment, receipt FROM submitted_reviews"
+            " WHERE paper_id = 'P1' AND serial = ? ORDER BY reviewer_id",
+            (serial,),
+        ).fetchall()
+        assert len(reviews) == 2
+        code = "fbk-" + secrets.token_hex(16)
+        conn.execute(
+            "INSERT INTO feedback_snapshots"
+            "(paper_id, version, serial, receipt1, receipt2, access_code,"
+            " review1, review2, created_at, invalidated)"
+            " VALUES (?,?,?,?,?,?,?,?,?,0)",
+            (
+                "P1", 1, serial, reviews[0]["receipt"], reviews[1]["receipt"], code,
+                _json.dumps({"score": reviews[0]["score"], "comment": reviews[0]["comment"]},
+                            ensure_ascii=False),
+                _json.dumps({"score": reviews[1]["score"], "comment": reviews[1]["comment"]},
+                            ensure_ascii=False),
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+
+    snap = export_snapshot(client)
+    wipe_instance()
+    r = restore(client, snap)
+    assert r.status_code == 422, r.text
+    assert "删除凭据冻结" in r.json()["detail"]
+    # 不留部分数据
+    assert client.get("/papers", headers=ORG).json()["papers"] == []
+    with db.read_txn() as conn:
+        assert db.get_revision(conn) == 0
+        assert conn.execute("SELECT COUNT(*) c FROM feedback_snapshots").fetchone()["c"] == 0
+        assert conn.execute("SELECT COUNT(*) c FROM paper_deletions").fetchone()["c"] == 0
 
 
 def test_restore_rejects_pending_objection_after_deletion(client):
